@@ -1,2 +1,2 @@
 # CellTag-multi-Repoducibility-Repo
-Repository for scirpts to re-produce all major analyses in the CellTag-multi paper
+Code to re-produce all major analyses in the CellTag-multi paper
