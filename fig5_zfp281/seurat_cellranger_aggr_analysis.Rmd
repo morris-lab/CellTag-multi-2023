@@ -1,0 +1,527 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(Seurat)
+library(SeuratDisk)
+library(ggpubr)
+library(Capybara)
+```
+
+#basic processing
+```{r}
+counts <- Read10X_h5("../cellranger_files/rna_agg-37256282/outs/count/filtered_feature_bc_matrix.h5")
+obj <- CreateSeuratObject(counts, min.cells = 3, min.features = 200)
+
+sample_info <- list()
+sample_info[['1']] <- 'empty'
+sample_info[['2']] <- 'zfp'
+sample_info_list <- unlist(sample_info[unlist(lapply(Cells(obj), function(x) {str_split(x,"-")[[1]][2]}))])
+names(sample_info_list) <- NULL
+
+obj$sample <- sample_info_list
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^mt-")
+obj <- subset(obj, subset = nFeature_RNA > 200 & nCount_RNA < 40000 & percent.mt < 10)
+
+VlnPlot(obj, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+obj <- NormalizeData(obj)
+obj <- FindVariableFeatures(obj, selection.method = "vst", nfeatures = 2000)
+obj <- ScaleData(obj)
+obj <- RunPCA(obj, features = VariableFeatures(object = obj))
+
+obj <- FindNeighbors(obj, dims = 1:30)
+obj <- FindClusters(obj)
+obj <- RunUMAP(obj, dims = 1:30)
+
+DimPlot(obj, group.by = "sample")
+
+FeaturePlot(obj, features = c("Apoa1","Cdh1","Col1a1","Col8a1"))
+Idents(obj) <- obj$sample
+markers <- FindMarkers(obj, ident.1 = "zfp", ident.2 = "empty", logfc.threshold = 0)
+markers$names<-rownames(markers)
+View(markers[markers$p_val_adj < 0.05,])
+VlnPlot(object = obj, features = c("Vegfd","Zfp281","Ctla2a","Hoxb9","Col8a1","Inhba"), group.by = "sample")
+```
+#run Capybara analysis
+```{r}
+library(Capybara)
+
+ref <- readRDS("./mef_reprogram_de_reference.Rds")
+ref <- ref[[3]]
+
+counts <- obj@assays$RNA@counts
+counts <- as.matrix(counts)
+
+
+single.round.QP.analysis(ref, counts, scale.bulk.sc = "scale", unix.par = TRUE,
+                         force.eq = 1, n.cores = 24, save.to.path = "./inter_files/",
+                         save.to.filename = "qp_scoring_mef_reprogram_de_cr_aggr")
+capy <- read.csv("./inter_files/qp_scoring_mef_reprogram_de_cr_aggr_scale.csv", row.names = 1)
+
+obj <- AddMetaData(obj, capy)
+
+VlnPlot(obj, features = c('Zfp281','Serpine1','Thbs1','Ctla2a',"Itga5","Fbln2"),
+        group.by = "sample", pt.size = 0)
+VlnPlot(obj, features = c("frxn_cell.type_cluster_reprogram","frxn_cell.type_cluster_mef"), pt.size=0.001)
+DimPlot(obj, reduction = "pca", dims = (3:4))
+
+meta <- as.data.frame(oe_combined_rna@meta.data)
+ggboxplot(meta, x='orig.ident',y="frxn_cell.type_cluster_reprogram") + stat_compare_means(comparisons=list(c("rna_empty","rna_zfp")))
+```
+#alt capybara analysis - without trangenes, zfp
+```{r}
+ref <- readRDS("./mef_reprogram_de_reference.Rds")
+ref <- ref[[3]]
+
+counts <- obj@assays$RNA@counts
+counts <- counts[!(rownames(counts) %in% c("GFP.CDS","Zfp281","FoxA1.HNF4a")),]
+
+counts <- as.matrix(counts)
+single.round.QP.analysis(ref, counts, scale.bulk.sc = "scale", unix.par = TRUE,
+                         force.eq = 1, n.cores = 24, save.to.path = "./inter_files/",
+                         save.to.filename = "qp_scoring_mef_reprogram_de_cr_aggr_no_transgenes")
+
+capy <- read.csv("./inter_files/qp_scoring_mef_reprogram_de_cr_aggr_no_transgenes_scale.csv", row.names = 1)
+colnames(capy) <- paste(colnames(capy),"nt",sep="_")
+
+obj <- AddMetaData(obj, capy)
+
+FeaturePlot(obj, features = c("frxn_cell.type_cluster_deadend_nt",   "frxn_cell.type_cluster_mef_nt",       "frxn_cell.type_cluster_reprogram_nt","frxn_cell.type_cluster_deadend",   "frxn_cell.type_cluster_mef",       "frxn_cell.type_cluster_reprogram"), ncol = 3)
+```
+
+```{r}
+DimHeatmap(obj, dims = 1:4, cells = 500, balanced = TRUE)
+```
+#cell cycle scoring
+```{r}
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+obj <- ScaleData(obj, features = rownames(obj))
+obj <- CellCycleScoring(obj, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+VlnPlot(obj, features = c("Lagrangian"), group.by = "sample")
+
+FeaturePlot(obj, features = c("Ctla2a",'Apoa1'))
+DimPlot(obj)
+
+#regress cell cycle
+obj <- ScaleData(obj, vars.to.regress = c("S.Score", "G2M.Score"), features = rownames(obj))
+obj <- RunPCA(obj, features = VariableFeatures(object = obj))
+
+obj <- FindNeighbors(obj, dims = 1:30)
+obj <- FindClusters(obj)
+obj <- RunUMAP(obj, dims = 1:30,reduction.key = "UMAP_cc_")
+
+DimPlot(obj, label = TRUE, group.by = c("sample","seurat_clusters"))
+saveRDS(obj,"./final_objs/cc_regressed_rna_cr_aggr.Rds")
+
+
+FeaturePlot(obj, features = c('Apoa1','Col1a2','Col1a1','FoxA1.HNF4a'))
+```
+
+#sample level markers
+```{r}
+Idents(obj) <- obj$sample
+markers_sample <- FindAllMarkers(obj)
+markers_sample <- markers_sample[markers_sample$p_val_adj < 0.05,]
+View(markers_sample)
+write.csv(markers_sample,"./inter_files/sample_markers_cr_aggr_cc_regress.csv")
+
+#add module scores for top d21 dead-end genes
+lineage_markers <- read.csv("../../AR_iEP_de_data/lineage_level/GEX_markers_lineage.csv", row.names = 1)
+lineage_markers <- lineage_markers[lineage_markers$group=='Day21 dead-end',]
+lineage_markers <- lineage_markers[order(lineage_markers$pvals_adj, decreasing = FALSE),]
+top_genes <- head(lineage_markers$names, n=21)
+
+#remove celltag.utr
+obj <- AddModuleScore(obj, features = list(top_genes),name='top_de_21')
+
+FeaturePlot(obj, features = c("top_de_211"))
+p1 <- ggboxplot(obj@meta.data, x='sample',y='top_de_211', fill='sample', ylab='top20 DE d21 module score') + stat_compare_means(comparisons=list(c("empty","zfp")))
+
+ggsave("./plots/top20_DEd21_mod_across_samples_box.pdf", height = 4, width = 3)
+
+#add module scores for top d21 reprograming genes
+lineage_markers <- read.csv("../../AR_iEP_de_data/lineage_level/GEX_markers_lineage.csv", row.names = 1)
+lineage_markers <- lineage_markers[lineage_markers$group=='Day21 Reprogramming',]
+lineage_markers <- lineage_markers[order(lineage_markers$pvals_adj, decreasing = FALSE),]
+top_genes <- head(lineage_markers$names, n=23)
+
+#remove celltag.utr
+obj <- AddModuleScore(obj, features = list(top_genes),name='top_rep_21')
+
+FeaturePlot(obj, features = c("top_rep_211"))
+write.csv(obj@meta.data,"./plot_data/top20_DEd21_mod_across_samples_box.csv")
+p1 <- ggboxplot(obj@meta.data, x='sample',y='top_rep_211', fill='sample', ylab='top20 Rep d21 module score') + stat_compare_means(comparisons=list(c("empty","zfp")))
+
+ggsave("./plots/top20_Repd21_mod_across_samples_box.pdf", height = 4, width = 3)
+
+p2 <- ggboxplot(obj@meta.data, x='sample',y='frxn_cell.type_cluster_deadend', fill='sample', ylab='dead-end Qp', xlab = "") + stat_compare_means(comparisons=list(c("empty","zfp"))) + theme(legend.position="none")
+p3 <- ggboxplot(obj@meta.data, x='sample',y='frxn_cell.type_cluster_mef', fill='sample', ylab='mef Qp', xlab = "") + stat_compare_means(comparisons=list(c("empty","zfp")))
+p4 <- ggboxplot(obj@meta.data, x='sample',y='frxn_cell.type_cluster_reprogram', fill='sample', ylab='reprogram Qp', xlab = "") + stat_compare_means(comparisons=list(c("empty","zfp")))+ theme(legend.position="none")
+
+ggsave("./plots/qp_across_samples_box.pdf",p2+p3+p4, height = 4, width = 7)
+
+p1
+```
+
+
+
+
+#distribution of samples across clusters
+```{r}
+plot_data <- table(obj@meta.data$seurat_clusters,obj@meta.data$sample)
+plot_data <- plot_data/rowSums(plot_data)
+plot_data <- melt(plot_data)
+colnames(plot_data) <- c("clusts","sample","value")
+plot_data$clusts <- as.character(plot_data$clusts)
+
+ggbarplot(plot_data, x = "clusts", y="value", fill = "sample")
+ggsave("./plots/sample_distr_across_clusters.pdf", width = 5, height = 3)
+
+Idents(obj) <- obj$seurat_clusters
+all_markers <- FindAllMarkers(obj)
+saveRDS(all_markers,"./inter_files/cluster_markers_cr_aggr_cc_regress.Rds")
+all_markers <- readRDS("./inter_files/cluster_markers_cr_aggr_cc_regress.Rds")
+all_markers_sub <- all_markers[(all_markers$p_val_adj < 0.05) & (all_markers$avg_log2FC > 0),]
+View(all_markers_sub[all_markers_sub$cluster==11,])
+all_markers_sub <- all_markers_sub[all_markers_sub$cluster %in% c(7,8,9,11),]
+
+all_markers_sub %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC) -> top10
+DoHeatmap(obj, features = top10$gene) + NoLegend()
+
+DimPlot(object = obj, cells.highlight = Cells(obj)[obj$seurat_clusters==0])
+p1 <- ggboxplot(obj@meta.data, x='sample',y="G2M.Score", fill='sample') + stat_compare_means(comparisons=list(c("empty","zfp")))
+
+
+```
+#sample specific changes within reprogramming
+```{r}
+Idents(obj) <- obj$seurat_clusters_old
+VlnPlot(obj, features = c('Ctla2a','Col4a1','Sfrp1', 'Col4a2','Cox6b2'), sort = TRUE, stack = TRUE, flip = TRUE)
+```
+```{r}
+DimPlot(obj, label = TRUE)
+```
+#fate-sample analysis
+```{r}
+obj$fate <- 'none'
+obj$fate[obj$seurat_clusters_old %in% c(7,3)] <- 'reprogram'
+# obj$fate[obj$seurat_clusters %in% c(10,4,6,14,0)] <- 'deadend'
+obj$fate[obj$seurat_clusters_old %in% c(2,0,6)] <- 'deadend'
+
+
+obj$fate_coarse <- obj$fate
+idx <- unlist(obj@reductions$umap@cell.embeddings[,1] < -1)
+names(idx) <- NULL
+obj$fate_coarse[(obj$fate_coarse=='deadend') & idx] <- 'none'
+
+plot_data <- table(obj@meta.data$sample,obj@meta.data$fate_coarse)
+plot_data <- plot_data/rowSums(plot_data)
+plot_data <- melt(plot_data)
+colnames(plot_data) <- c("sample","fate","value")
+# plot_data$clusts <- as.character(plot_data$clusts)
+
+p1 <- ggbarplot(plot_data, x = "sample", y="value", fill = "fate", palette = get_palette(c("#e6550d","#d3d3d3","#756bb1"),3)) +
+  scale_y_continuous(expand = c(0,0),labels = label_number(accuracy = 0.1),
+                     limits = c(0,1))
+ggsave("./plots/sample_fate_composition_barplot.pdf", height = 4, width = 3)
+write.csv(plot_data,"./plot_data/sample_fate_composition_barplot.csv")
+
+obj$fate <- paste(obj$fate_coarse, obj$sample, sep="-")
+
+Idents(obj) <- obj$fate
+reprogram_sample_markers <- FindMarkers(obj, ident.1 = "reprogram-zfp", ident.2 = "reprogram-empty")
+reprogram_sample_markers <- reprogram_sample_markers[reprogram_sample_markers$p_val_adj < 0.05,]
+View(reprogram_sample_markers)
+write.csv(reprogram_sample_markers,"./inter_files/repZ_vs_repE_DEmarkers.csv")
+reprogram_sample_markers <- read.csv("./inter_files/repZ_vs_repE_DEmarkers.csv", row.names = 1)
+
+deadend_sample_markers <- FindMarkers(obj, ident.1 = "deadend-zfp", ident.2 = "deadend-empty")
+deadend_sample_markers <- deadend_sample_markers[deadend_sample_markers$p_val_adj < 0.05,]
+View(deadend_sample_markers)
+write.csv(deadend_sample_markers,"./inter_files/deadZ_vs_deadE_DEmarkers.csv")
+
+
+plot_genes <- rbind(head(reprogram_sample_markers[order(reprogram_sample_markers$avg_log2FC),],7),head(reprogram_sample_markers[order(reprogram_sample_markers$avg_log2FC, decreasing = TRUE),],5))
+plot_genes <- rownames(plot_genes)
+plot_cells <- Cells(obj)[obj$fate %in% c("reprogram-empty",'reprogram-zfp')]
+
+
+DoHeatmap(obj, features = plot_genes, cells = plot_cells)
+
+plot_genes <- plot_genes[!plot_genes %in% c("FoxA1.HNF4a",'GFP.CDS')]
+
+
+obj@meta.data$fate <- factor(obj@meta.data$fate,
+                             levels =c("none-zfp","none-empty","reprogram-zfp",
+                                       "reprogram-empty","deadend-zfp","deadend-empty"))
+
+write.csv(obj@meta.data, "./plot_data/qp_across_reprog_samples_box.csv")
+p1 <- ggboxplot(obj@meta.data[obj@meta.data$fate %in% c("reprogram-zfp","reprogram-empty"),], x='fate',y='frxn_cell.type_cluster_reprogram', fill='sample', ylab='Reprogramming Qp Score', xlab="") + rotate_x_text(45) +  stat_compare_means(comparisons=list(c("reprogram-empty","reprogram-zfp")))
+p2 <- ggboxplot(obj@meta.data[obj@meta.data$fate %in% c("deadend-zfp","deadend-empty"),], x='fate',y='frxn_cell.type_cluster_deadend', fill='sample', ylab='Deadend Qp Score', xlab="") + rotate_x_text(45)+ stat_compare_means(comparisons=list(c("deadend-empty","deadend-zfp")))
+p3 <- ggboxplot(obj@meta.data[obj@meta.data$fate %in% c("deadend-zfp","deadend-empty"),], x='fate',y='frxn_cell.type_cluster_mef', fill='sample', ylab='Fibroblast Qp Score', xlab="") + rotate_x_text(45)+ stat_compare_means(comparisons=list(c("deadend-empty","deadend-zfp")))
+
+ggsave("./plots/qp_across_reprog_samples_box.pdf", p1+p2+p3,width = 8, height = 5)
+
+DimPlot(obj, label = TRUE)
+VlnPlot(obj, features = c("Col1a2"), group.by = "seurat_clusters",sort = TRUE)
+
+saveRDS(obj,"./final_objs/cc_regressed_rna_cr_aggr.Rds")
+
+p1+p2+p3
+```
+
+
+
+
+#progeny pathway analysis
+```{r}
+library(progeny)
+Idents(obj) <- obj$fate
+CellsClusters <- data.frame(Cell = names(Idents(obj)), 
+    CellType = as.character(Idents(obj)),
+    stringsAsFactors = FALSE)
+
+obj <- progeny(obj, scale=FALSE, organism="Mouse", top=500, perm=1, 
+    return_assay = TRUE)
+
+obj2 <- Seurat::ScaleData(obj, assay = "progeny") 
+
+## We transform Progeny scores into a data frame to better handling the results
+progeny_scores_df <- 
+    as.data.frame(t(GetAssayData(obj2, slot = "scale.data", 
+        assay = "progeny"))) %>%
+    rownames_to_column("Cell") %>%
+    gather(Pathway, Activity, -Cell) 
+
+## We match Progeny scores with the cell clusters.
+progeny_scores_df <- inner_join(progeny_scores_df, CellsClusters)
+
+## We summarize the Progeny scores by cellpopulation
+summarized_progeny_scores <- progeny_scores_df %>% 
+    group_by(Pathway, CellType) %>%
+    summarise(avg = mean(Activity), std = sd(Activity))
+
+## We prepare the data for the plot
+summarized_progeny_scores_df <- summarized_progeny_scores %>%
+    dplyr::select(-std) %>%   
+    spread(Pathway, avg) %>%
+    data.frame(row.names = 1, check.names = FALSE, stringsAsFactors = FALSE) 
+
+paletteLength = 100
+myColor = colorRampPalette(c("Darkblue", "white","red"))(paletteLength)
+
+progenyBreaks = c(seq(min(summarized_progeny_scores_df), 0, 
+                      length.out=ceiling(paletteLength/2) + 1),
+                  seq(max(summarized_progeny_scores_df)/paletteLength, 
+                      max(summarized_progeny_scores_df), 
+                      length.out=floor(paletteLength/2)))
+progeny_hmap = pheatmap(t(summarized_progeny_scores_df[,-1]),fontsize=14, 
+                        fontsize_row = 10, 
+                        color=myColor, breaks = progenyBreaks, 
+                        main = "PROGENy (500)", angle_col = 45,
+                        treeheight_col = 0,  border_color = NA)
+
+pathway_scores <- t(as.data.frame(obj2@assays$progeny@scale.data))
+pathway_scores <- as.data.frame(pathway_scores)
+obj <- AddMetaData(obj, pathway_scores)
+
+ggboxplot(obj@meta.data[obj@meta.data$fate %in% c("deadend-zfp","deadend-empty"),], x='fate',y='Estrogen', fill='sample', ylab='deadend', xlab="") + rotate_x_text(45) +  stat_compare_means(comparisons=list(c("deadend-empty","deadend-zfp")))
+saveRDS(obj, "./final_objs/cc_regressed_rna_cr_aggr.Rds")
+
+
+SaveH5Seurat(obj,"./final_objs/cc_regressed_rna_cr_aggr.h5Seurat")
+Convert("./final_objs/cc_regressed_rna_cr_aggr.h5Seurat",dest="h5ad")
+
+
+Idents(obj) <- obj$sample
+DotPlot(obj, features = c("TGFb","WNT","Ctla2a","Cdh1","Zfp281","Apoa1","Gsta4","Krt19","Cd9"))
+```
+
+#bin zfp cells by zfp expression levels
+```{r}
+Idents(obj) <- obj$fate
+VlnPlot(obj, features = "Tagln", assay = "RNA", slot = "counts")
+zfp_idx <- c(obj@assays$RNA@data['Zfp281',] >=1)
+names(zfp_idx) <- NULL
+
+obj$zfp_bin <- 'none'
+obj$zfp_bin[obj$sample=='zfp'] <- 'low'
+obj$zfp_bin[zfp_idx] <-'high'
+
+Idents(obj) <- obj$zfp_bin
+markers_zfp_bin <- FindMarkers(obj, ident.1 = 'high', ident.2 = 'low')
+markers_zfp_bin <- markers_zfp_bin[markers_zfp_bin$p_val_adj < 0.05,]
+markers_zfp_bin <- markers_zfp_bin[!rownames(markers_zfp_bin) %in% c("FoxA1.HNF4a","GFP.CDS"),]
+View(markers_zfp_bin)
+write.csv(markers_zfp_bin,"./inter_files/ZFPHighZ_vs_ZFPLowZ_DEmarkers.csv")
+
+ft <- rownames(head(markers_zfp_bin[order(markers_zfp_bin$avg_log2FC, decreasing = FALSE),],10))
+FeaturePlot(obj, features = c(ft))
+```
+```{r}
+VlnPlot(obj, features = c("Vegfd",'Gsn','Col4a1','Zfp148',
+                          'Col4a2','Ctla2a','Cox6b2'), pt.size = 0,flip = TRUE, log = FALSE, stack = TRUE)
+#cox6b2 confers proliferative advantage in hypoxia
+```
+
+#checking for dynamics within each fate seems promising, redo fate annotations but more finely
+```{r}
+obj$seurat_clusters_old <- obj$seurat_clusters
+obj <- FindClusters(obj, resolution = 2)
+
+DimPlot(obj, label = TRUE)
+
+VlnPlot(obj, 'frxn_cell.type_cluster_deadend', sort = TRUE)
+
+FeaturePlot(obj, features = c("frxn_cell.type_cluster_deadend","frxn_cell.type_cluster_mef",
+                              "frxn_cell.type_cluster_reprogram",'G2M.Score','S.Score'))
+```
+
+```{r}
+DimPlot(obj, label = TRUE)
+#reprogramming <- 0,7,12
+#deadend <- 9,13,22,1,11,16,10
+
+obj$fate2 <- 'none'
+obj$fate2[obj$seurat_clusters %in% c(0,7,12)] <- 'reprogram'
+obj$fate2[obj$seurat_clusters %in% c(9,13,22,1,11,16,10)] <- 'deadend'
+
+plot_data <- table(obj@meta.data$sample,obj@meta.data$fate2)
+plot_data <- plot_data/rowSums(plot_data)
+plot_data <- melt(plot_data)
+colnames(plot_data) <- c("sample","fate","value")
+# plot_data$clusts <- as.character(plot_data$clusts)
+
+ggbarplot(plot_data, x = "sample", y="value", fill = "fate")
+
+obj$fate2 <- paste(obj$fate2, obj$sample, sep="-")
+
+Idents(obj) <- obj$fate2
+reprogram_sample_markers <- FindMarkers(obj, ident.1 = "reprogram-zfp", ident.2 = "reprogram-empty")
+reprogram_sample_markers <- reprogram_sample_markers[reprogram_sample_markers$p_val_adj < 0.05,]
+View(reprogram_sample_markers)
+write.csv(reprogram_sample_markers,"./inter_files/repZ_vs_repE_DEmarkers_fate2.csv")
+
+deadend_sample_markers <- FindMarkers(obj, ident.1 = "deadend-zfp", ident.2 = "deadend-empty")
+deadend_sample_markers <- deadend_sample_markers[deadend_sample_markers$p_val_adj < 0.05,]
+View(deadend_sample_markers)
+write.csv(deadend_sample_markers,"./inter_files/deadZ_vs_deadE_DEmarkers_fate2.csv")
+
+
+plot_genes <- rbind(head(reprogram_sample_markers[order(reprogram_sample_markers$avg_log2FC),],7),head(reprogram_sample_markers[order(reprogram_sample_markers$avg_log2FC, decreasing = TRUE),],5))
+plot_genes <- rownames(plot_genes)
+plot_cells <- Cells(obj)[obj$fate %in% c("reprogram-empty",'reprogram-zfp')]
+
+
+DoHeatmap(obj, features = plot_genes, cells = plot_cells)
+
+plot_genes <- plot_genes[!plot_genes %in% c("FoxA1.HNF4a",'GFP.CDS')]
+
+
+obj@meta.data$fate2 <- factor(obj@meta.data$fate2,
+                             levels =c("none-zfp","none-empty","reprogram-zfp",
+                                       "reprogram-empty","deadend-zfp","deadend-empty"))
+
+write.csv(obj@meta.data, "./plot_data/qp_across_reprog_samples_box_fate2.csv")
+p1 <- ggboxplot(obj@meta.data[obj@meta.data$fate2 %in% c("reprogram-zfp","reprogram-empty"),], x='fate2',y='frxn_cell.type_cluster_reprogram', fill='sample', ylab='Reprogramming Qp Score', xlab="") + rotate_x_text(45) +  stat_compare_means(comparisons=list(c("reprogram-empty","reprogram-zfp")))
+p2 <- ggboxplot(obj@meta.data[obj@meta.data$fate2 %in% c("deadend-zfp","deadend-empty"),], x='fate2',y='frxn_cell.type_cluster_deadend', fill='sample', ylab='Deadend Qp Score', xlab="") + rotate_x_text(45)+ stat_compare_means(comparisons=list(c("deadend-empty","deadend-zfp")))
+p3 <- ggboxplot(obj@meta.data[obj@meta.data$fate2 %in% c("deadend-zfp","deadend-empty"),], x='fate2',y='frxn_cell.type_cluster_mef', fill='sample', ylab='Fibroblast Qp Score', xlab="") + rotate_x_text(45)+ stat_compare_means(comparisons=list(c("deadend-empty","deadend-zfp")))
+
+ggsave("./plots/qp_across_reprog_samples_box_fate2.pdf", p1+p2+p3,width = 8, height = 5)
+
+DimPlot(obj, label = TRUE)
+VlnPlot(obj, features = c("Col1a2"), group.by = "seurat_clusters",sort = TRUE)
+
+saveRDS(obj,"./final_objs/cc_regressed_rna_cr_aggr.Rds")
+
+
+p1+p2+p3
+```
+
+
+#Plot boxplots
+```{r}
+meta_data <- read.csv("./inter_files/zfp_oe_metadata.csv", row.names = 1)
+meta_data <- meta_data[meta_data$fate_coarse !='none',]
+
+p1 <- ggboxplot(meta_data, x='fate_coarse', y='frxn_cell.type_cluster_reprogram', fill='sample',palette = get_palette(c("#440154", "#35b779"), 2)) + scale_y_continuous(labels = label_number(accuracy = 0.1)) + stat_compare_means(comparisons = list(c('Contol','Zfp281 OE')))
+
+p2 <- ggboxplot(meta_data, x='fate_coarse', y='frxn_cell.type_cluster_deadend', fill='sample',palette = get_palette(c("#440154", "#35b779"), 2)) + scale_y_continuous(labels = label_number(accuracy = 0.1))
+
+
+p1 + p2
+
+ggsave("./plots/zfp_oe_qp_score_boxplot.pdf", p1+p2, width = 4.5, height = 3)
+
+p3 <- ggboxplot(meta_data, x='fate_coarse', y='frxn_cell.type_cluster_reprogram', fill='sample2',palette = get_palette(c("#440154", "#35b779","#fde725"), 3)) + scale_y_continuous(labels = label_number(accuracy = 0.1))
+
+p4 <- ggboxplot(meta_data, x='fate_coarse', y='frxn_cell.type_cluster_deadend', fill='sample2',palette = get_palette(c("#440154", "#35b779","#fde725"), 3)) + scale_y_continuous(labels = label_number(accuracy = 0.1))
+
+p3+p4
+
+ggsave("./plots/zfp_oe_hige_qp_score_boxplot.pdf", p3+p4, width = 4.5, height = 3)
+
+```
+
+
+#GO analysis section
+```{r}
+library(clusterProfiler)
+library(org.Mm.eg.db)
+ego <- enrichGO(gene = rownames(markers_zfp_bin[markers_zfp_bin$avg_log2FC > 0.2,]), 
+                    keyType = "SYMBOL", 
+                    OrgDb = org.Mm.eg.db, 
+                    ont = "BP", 
+                    pAdjustMethod = "BH", 
+                    qvalueCutoff = 0.05, 
+                    readable = FALSE)
+
+goi <- markers_zfp_bin[markers_zfp_bin$avg_log2FC > 0,]
+goi_list <- goi$avg_log2FC
+names(goi_list) <- rownames(goi)
+goi_list <- goi_list[order(goi_list, decreasing = TRUE)]
+
+
+gse <- gseGO(geneList=goi_list, 
+             ont ="BP", 
+             keyType = "SYMBOL", 
+             minGSSize = 3, 
+             maxGSSize = 800, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             scoreType='pos',
+             OrgDb = org.Mm.eg.db, 
+             pAdjustMethod = "none")
+
+dotplot(gse)
+
+
+
+
+goi_list <- list(rownames(markers_zfp_bin[markers_zfp_bin$avg_log2FC > 0,]),
+                 rownames(markers_zfp_bin[markers_zfp_bin$avg_log2FC < 0,]))
+names(goi_list) <- c("High","Low")
+
+
+
+ck <- compareCluster(geneCluster = goi_list, fun = enrichGO,keyType = "SYMBOL", 
+                    OrgDb = org.Mm.eg.db, 
+                    ont = "BP", 
+                    pAdjustMethod = "BH", 
+                    qvalueCutoff = 0.05, 
+                    readable = FALSE)
+
+dotplot(ck)
+```
+
+#
